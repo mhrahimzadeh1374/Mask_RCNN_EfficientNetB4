@@ -105,19 +105,19 @@ class CocoDataset(utils.Dataset):
         auto_download: Automatically download and unzip MS-COCO images and annotations
         """
 
-        if auto_download is True:
-            self.auto_download(dataset_dir, subset, year)
+        #if auto_download is True:
+            #self.auto_download(dataset_dir, subset, year)
 
-        coco = COCO("{}/annotations/instances_{}{}.json".format(dataset_dir, subset, year))
-        if subset == "minival" or subset == "valminusminival":
-            subset = "val"
-        image_dir = "{}/{}{}".format(dataset_dir, subset, year)
+        coco = COCO(dataset_dir)
+        #if subset == "minival" or subset == "valminusminival":
+            #subset = "val"
+        image_dir = dataset_dir
 
         # Load all classes or a subset?
         if not class_ids:
             # All classes
             class_ids = sorted(coco.getCatIds())
-
+            print(class_ids)
         # All images or a subset?
         if class_ids:
             image_ids = []
@@ -135,9 +135,10 @@ class CocoDataset(utils.Dataset):
 
         # Add images
         for i in image_ids:
+            #print(coco.loadAnns(coco.getAnnIds(imgIds=[i], catIds=class_ids, iscrowd=None)))
             self.add_image(
                 "coco", image_id=i,
-                path=os.path.join(image_dir, coco.imgs[i]['file_name']),
+                path=os.path.join('../val2017', coco.imgs[i]['file_name']),
                 width=coco.imgs[i]["width"],
                 height=coco.imgs[i]["height"],
                 annotations=coco.loadAnns(coco.getAnnIds(
@@ -471,7 +472,7 @@ if __name__ == '__main__':
 
     # Load weights
     print("Loading weights ", model_path)
-    model.load_weights(model_path, by_name=True)
+    #model.load_weights(model_path, by_name=True)
 
     # Train or evaluate
     if args.command == "train":
