@@ -168,42 +168,328 @@ def conv_block(input_tensor, kernel_size, filters, stage, block,
     return x
 
 
-def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
-    """Build a ResNet graph.
-        architecture: Can be resnet50 or resnet101
-        stage5: Boolean. If False, stage5 of the network is not created
-        train_bn: Boolean. Train or freeze Batch Norm layers
+
+import keras 
+from keras import layers
+import math
+import tensorflow as tf
+
+
+DEFAULT_BLOCKS_ARGS = [
+    {'kernel_size': 3, 'repeats': 1, 'filters_in': 32, 'filters_out': 16,
+     'expand_ratio': 1, 'id_skip': True, 'strides': 1, 'se_ratio': 0.25},
+    {'kernel_size': 3, 'repeats': 2, 'filters_in': 16, 'filters_out': 24,
+     'expand_ratio': 6, 'id_skip': True, 'strides': 2, 'se_ratio': 0.25},
+    {'kernel_size': 5, 'repeats': 2, 'filters_in': 24, 'filters_out': 40,
+     'expand_ratio': 6, 'id_skip': True, 'strides': 2, 'se_ratio': 0.25},
+    {'kernel_size': 3, 'repeats': 3, 'filters_in': 40, 'filters_out': 80,
+     'expand_ratio': 6, 'id_skip': True, 'strides': 2, 'se_ratio': 0.25},
+    {'kernel_size': 5, 'repeats': 3, 'filters_in': 80, 'filters_out': 112,
+     'expand_ratio': 6, 'id_skip': True, 'strides': 1, 'se_ratio': 0.25},
+    {'kernel_size': 5, 'repeats': 4, 'filters_in': 112, 'filters_out': 192,
+     'expand_ratio': 6, 'id_skip': True, 'strides': 2, 'se_ratio': 0.25},
+    {'kernel_size': 3, 'repeats': 1, 'filters_in': 192, 'filters_out': 320,
+     'expand_ratio': 6, 'id_skip': True, 'strides': 1, 'se_ratio': 0.25}
+]
+
+CONV_KERNEL_INITIALIZER = {
+    'class_name': 'VarianceScaling',
+    'config': {
+        'scale': 2.0,
+        'mode': 'fan_out',
+        # EfficientNet actually uses an untruncated normal distribution for
+        # initializing conv layers, but keras.initializers.VarianceScaling use
+        # a truncated distribution.
+        # We decided against a custom initializer for better serializability.
+        'distribution': 'normal'
+    }
+}
+
+DENSE_KERNEL_INITIALIZER = {
+    'class_name': 'VarianceScaling',
+    'config': {
+        'scale': 1. / 3.,
+        'mode': 'fan_out',
+        'distribution': 'uniform'
+    }
+}
+
+def swish(x):
+    """Swish activation function.
+    # Arguments
+        x: Input tensor.
+    # Returns
+        The Swish activation: `x * sigmoid(x)`.
+    # References
+        [Searching for Activation Functions](https://arxiv.org/abs/1710.05941)
     """
-    assert architecture in ["resnet50", "resnet101"]
-    # Stage 1
-    x = KL.ZeroPadding2D((3, 3))(input_image)
-    x = KL.Conv2D(64, (7, 7), strides=(2, 2), name='conv1', use_bias=True)(x)
-    x = BatchNorm(name='bn_conv1')(x, training=train_bn)
-    x = KL.Activation('relu')(x)
-    C1 = x = KL.MaxPooling2D((3, 3), strides=(2, 2), padding="same")(x)
-    # Stage 2
-    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1), train_bn=train_bn)
-    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b', train_bn=train_bn)
-    C2 = x = identity_block(x, 3, [64, 64, 256], stage=2, block='c', train_bn=train_bn)
-    # Stage 3
-    x = conv_block(x, 3, [128, 128, 512], stage=3, block='a', train_bn=train_bn)
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b', train_bn=train_bn)
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c', train_bn=train_bn)
-    C3 = x = identity_block(x, 3, [128, 128, 512], stage=3, block='d', train_bn=train_bn)
-    # Stage 4
-    x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a', train_bn=train_bn)
-    block_count = {"resnet50": 5, "resnet101": 22}[architecture]
-    for i in range(block_count):
-        x = identity_block(x, 3, [256, 256, 1024], stage=4, block=chr(98 + i), train_bn=train_bn)
-    C4 = x
-    # Stage 5
-    if stage5:
-        x = conv_block(x, 3, [512, 512, 2048], stage=5, block='a', train_bn=train_bn)
-        x = identity_block(x, 3, [512, 512, 2048], stage=5, block='b', train_bn=train_bn)
-        C5 = x = identity_block(x, 3, [512, 512, 2048], stage=5, block='c', train_bn=train_bn)
+    return tf.nn.swish(x)
+
+def get_submodules_from_kwargs(kwargs):
+    backend = kwargs.get('backend', _KERAS_BACKEND)
+    layers = kwargs.get('layers', _KERAS_LAYERS)
+    models = kwargs.get('models', _KERAS_MODELS)
+    utils = kwargs.get('utils', _KERAS_UTILS)
+    for key in kwargs.keys():
+        if key not in ['backend', 'layers', 'models', 'utils']:
+            raise TypeError('Invalid keyword argument: %s', key)
+    return backend, layers, models, utils
+
+def correct_pad(backend, inputs, kernel_size):
+    """Returns a tuple for zero-padding for 2D convolution with downsampling.
+    # Arguments
+        input_size: An integer or tuple/list of 2 integers.
+        kernel_size: An integer or tuple/list of 2 integers.
+    # Returns
+        A tuple.
+    """
+    img_dim = 2 if backend.image_data_format() == 'channels_first' else 1
+    input_size = backend.int_shape(inputs)[img_dim:(img_dim + 2)]
+
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size, kernel_size)
+
+    if input_size[0] is None:
+        adjust = (1, 1)
     else:
-        C5 = None
-    return [C1, C2, C3, C4, C5]
+        adjust = (1 - input_size[0] % 2, 1 - input_size[1] % 2)
+
+    correct = (kernel_size[0] // 2, kernel_size[1] // 2)
+
+    return ((correct[0] - adjust[0], correct[0]),
+            (correct[1] - adjust[1], correct[1]))
+    
+def block(inputs, activation_fn=swish, drop_rate=0., name='',
+          filters_in=32, filters_out=16, kernel_size=3, strides=1,
+          expand_ratio=1, se_ratio=0., id_skip=True):
+  
+    bn_axis = 3
+
+    # Expansion phase
+    filters = filters_in * expand_ratio
+    if expand_ratio != 1:
+        x = layers.Conv2D(filters, 1,
+                          padding='same',
+                          use_bias=False,
+                          kernel_initializer=CONV_KERNEL_INITIALIZER,
+                          name=name + 'expand_conv')(inputs)
+        x = layers.BatchNormalization(axis=bn_axis, name=name + 'expand_bn')(x)
+        x = layers.Activation(activation_fn, name=name + 'expand_activation')(x)
+    else:
+        x = inputs
+
+    # Depthwise Convolution
+    if strides == 2:
+        x = layers.ZeroPadding2D(padding=correct_pad(keras.backend, x, kernel_size),
+                                 name=name + 'dwconv_pad')(x)
+        conv_pad = 'valid'
+    else:
+        conv_pad = 'same'
+    x = layers.DepthwiseConv2D(kernel_size,
+                               strides=strides,
+                               padding=conv_pad,
+                               use_bias=False,
+                               depthwise_initializer=CONV_KERNEL_INITIALIZER,
+                               name=name + 'dwconv')(x)
+    x = layers.BatchNormalization(axis=bn_axis, name=name + 'bn')(x)
+    x = layers.Activation(activation_fn, name=name + 'activation')(x)
+
+    # Squeeze and Excitation phase
+    if 0 < se_ratio <= 1:
+        filters_se = max(1, int(filters_in * se_ratio))
+        se = layers.GlobalAveragePooling2D(name=name + 'se_squeeze')(x)
+        if bn_axis == 1:
+            se = layers.Reshape((filters, 1, 1), name=name + 'se_reshape')(se)
+        else:
+            se = layers.Reshape((1, 1, filters), name=name + 'se_reshape')(se)
+        se = layers.Conv2D(filters_se, 1,
+                           padding='same',
+                           activation=activation_fn,
+                           kernel_initializer=CONV_KERNEL_INITIALIZER,
+                           name=name + 'se_reduce')(se)
+        se = layers.Conv2D(filters, 1,
+                           padding='same',
+                           activation='sigmoid',
+                           kernel_initializer=CONV_KERNEL_INITIALIZER,
+                           name=name + 'se_expand')(se)
+        x = layers.multiply([x, se], name=name + 'se_excite')
+
+    # Output phase
+    C = x = layers.Conv2D(filters_out, 1,
+                      padding='same',
+                      use_bias=False,
+                      kernel_initializer=CONV_KERNEL_INITIALIZER,
+                      name=name + 'project_conv')(x)
+    x = layers.BatchNormalization(axis=bn_axis, name=name + 'project_bn')(x)
+    if (id_skip is True and strides == 1 and filters_in == filters_out):
+        if drop_rate > 0:
+            x = layers.Dropout(drop_rate,
+                               noise_shape=(None, 1, 1, 1),
+                               name=name + 'drop')(x)
+        x = layers.add([x, inputs], name=name + 'add')
+
+    return x
+
+
+def resnet_graph(input_image, architecture, stage5=False, train_bn=True,model_version='effb0'):
+  if model_version=='effb0':
+     width_coefficient=1.0
+     depth_coefficient=1.0
+     default_size=224
+     dropout_rate=0.2
+  elif model_version=='effb4':
+     width_coefficient=1.4
+     depth_coefficient=1.8
+     default_size=380
+     dropout_rate=0.4
+  drop_connect_rate=0.2
+  depth_divisor=8
+  activation_fn=swish
+  blocks_args=DEFAULT_BLOCKS_ARGS
+  model_name='efficientnetb0'
+  include_top=True
+  weights='imagenet'
+  input_tensor=None
+  input_shape=None
+  pooling=None
+  classes=1000
+
+  global backend, layers, models, keras_utils
+  #backend, layers, models, keras_utils = get_submodules_from_kwargs(kwargs)
+
+  #backend=keras.backend
+
+  if not (weights in {'imagenet', None} or os.path.exists(weights)):
+      raise ValueError('The `weights` argument should be either '
+                        '`None` (random initialization), `imagenet` '
+                        '(pre-training on ImageNet), '
+                        'or the path to the weights file to be loaded.')
+
+  if weights == 'imagenet' and include_top and classes != 1000:
+      raise ValueError('If using `weights` as `"imagenet"` with `include_top`'
+                        ' as true, `classes` should be 1000')
+
+  # Determine proper input shape
+  #img_input = keras.layers.Input(
+              #shape=[None, None, 3], name="input_image")
+  img_input=input_image
+  """
+  if input_tensor is None:
+      img_input = layers.Input(shape=input_shape)
+  else:
+      if not backend.is_keras_tensor(input_tensor):
+          img_input = layers.Input(tensor=input_tensor, shape=input_shape)
+      else:
+          img_input = input_tensor
+  """
+  #bn_axis = 3 if backend.image_data_format() == 'channels_last' else 1
+  bn_axis = 3
+
+  def round_filters(filters, divisor=depth_divisor):
+      """Round number of filters based on depth multiplier."""
+      filters *= width_coefficient
+      new_filters = max(divisor, int(filters + divisor / 2) // divisor * divisor)
+      # Make sure that round down does not go down by more than 10%.
+      if new_filters < 0.9 * filters:
+          new_filters += divisor
+      return int(new_filters)
+
+  def round_repeats(repeats):
+      """Round number of repeats based on depth multiplier."""
+      return int(math.ceil(depth_coefficient * repeats))
+
+  # Build stem
+  x = img_input
+  x = layers.ZeroPadding2D(padding=correct_pad(keras.backend, x, 3),
+                            name='stem_conv_pad')(x)
+  x = layers.Conv2D(round_filters(32), 3,
+                    strides=2,
+                    padding='valid',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='stem_conv')(x)
+  x = layers.BatchNormalization(axis=bn_axis, name='stem_bn')(x)
+  x = layers.Activation(activation_fn, name='stem_activation')(x)
+
+  # Build blocks
+  from copy import deepcopy
+  blocks_args = deepcopy(blocks_args)
+
+  b = 0
+  blocks = float(sum(args['repeats'] for args in blocks_args))
+  for (i, args) in enumerate(blocks_args):
+      assert args['repeats'] > 0
+      # Update block input and output filters based on depth multiplier.
+      args['filters_in'] = round_filters(args['filters_in'])
+      args['filters_out'] = round_filters(args['filters_out'])
+
+      for j in range(round_repeats(args.pop('repeats'))):
+          # The first block needs to take care of stride and filter size increase.
+          if j > 0:
+              args['strides'] = 1
+              args['filters_in'] = args['filters_out']
+
+          C=x = block(x, activation_fn, drop_connect_rate * b / blocks,
+                    name='block{}{}_'.format(i + 1, chr(j + 97)), **args)
+          globals()['C{}'.format(b)]=C
+          b += 1
+
+
+  # Build top
+  x = layers.Conv2D(round_filters(1280), 1,
+                    padding='same',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='top_conv')(x)
+  x = layers.BatchNormalization(axis=bn_axis, name='top_bn')(x)
+  x = layers.Activation(activation_fn, name='top_activation')(x)
+
+
+  if model_version=='effb0':
+    a=globals()['C{}'.format(1)]
+    b=globals()['C{}'.format(2)]
+    c=globals()['C{}'.format(4)]
+    d=globals()['C{}'.format(10)]
+    e=globals()['C{}'.format(15)]
+  elif model_version=='effb4':
+    a=globals()['C{}'.format(1)]
+    b=globals()['C{}'.format(5)]
+    c=globals()['C{}'.format(9)]
+    d=globals()['C{}'.format(21)]
+    e=globals()['C{}'.format(31)]
+
+
+
+  if stage5:
+    a=layers.Conv2D(64, 1,
+                    padding='same',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='C1')(a)
+    b=layers.Conv2D(256, 1,
+                    padding='same',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='C2')(b)
+    c=layers.Conv2D(512, 1,
+                    padding='same',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='C3')(c)
+    d=layers.Conv2D(1024, 1,
+                    padding='same',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='C5')(d)
+    e=layers.Conv2D(2048, 1,
+                    padding='same',
+                    use_bias=False,
+                    kernel_initializer=CONV_KERNEL_INITIALIZER,
+                    name='C15')(e)
+    print([a, b, c, d, e])
+    return [a, b, c, d, e]
+  else:
+    return [a, b, c, d, None]
 
 
 ############################################################
@@ -1835,7 +2121,6 @@ class MaskRCNN():
         self.model_dir = model_dir
         self.set_log_dir()
         self.keras_model = self.build(mode=mode, config=config)
-
     def build(self, mode, config):
         """Build Mask R-CNN architecture.
             input_shape: The shape of the input image.
