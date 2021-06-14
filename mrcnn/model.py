@@ -331,7 +331,7 @@ def block(inputs, activation_fn=swish, drop_rate=0., name='',
     return x
 
 
-def resnet_graph(input_image, architecture, stage5=False, train_bn=True,model_version='effb0'):
+def resnet_graph(input_image, architecture, stage5=False, train_bn=True,model_version='effb4'):
   if model_version=='effb0':
      width_coefficient=1.0
      depth_coefficient=1.0
