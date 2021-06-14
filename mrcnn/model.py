@@ -487,6 +487,7 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True,model_ve
                     kernel_initializer=CONV_KERNEL_INITIALIZER,
                     name='C15')(e)
     print([a, b, c, d, e])
+    print('Running on {} Model'.format(model_version))
     return [a, b, c, d, e]
   else:
     return [a, b, c, d, None]
